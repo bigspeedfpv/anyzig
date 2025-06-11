@@ -861,16 +861,65 @@ fn makeOfficialUrl(arena: Allocator, semantic_version: SemanticVersion) Download
     };
 }
 
+const ZlsOpt = struct {
+    tarball: []const u8,
+    shasum: []const u8,
+    size: []const u8,
+};
+
+fn getZlsUrl(allocator: Allocator, semantic_version: SemanticVersion) ![]const u8 {
+    var client = std.http.Client{ .allocator = allocator };
+    defer client.deinit();
+
+    client.initDefaultProxies(allocator) catch @panic("proxy error");
+
+    const uri = std.mem.replaceOwned(
+        u8,
+        allocator,
+        try std.fmt.allocPrint(
+            allocator,
+            "https://releases.zigtools.org/v1/zls/select-version?zig_version={}&compatibility=only-runtime",
+            .{semantic_version},
+        ),
+        "+",
+        "%2B",
+    ) catch |e| oom(e);
+
+    var response_body = std.ArrayList(u8).init(allocator);
+    defer response_body.deinit();
+    _ = client.fetch(.{
+        .method = .GET,
+        .location = .{ .url = uri },
+        .extra_headers = &[_]std.http.Header{},
+        .response_storage = .{ .dynamic = &response_body },
+    }) catch @panic("zls fetch failed");
+
+    const res_json = std.json.parseFromSlice(std.json.Value, allocator, response_body.items, .{}) catch @panic("target parse failed");
+    defer res_json.deinit();
+    const res_val = res_json.value;
+
+    switch (res_val) {
+        .object => {
+            res_val.dump();
+            const target = res_val.object.get(arch_os) orelse @panic("no ZLS build for current platform");
+            const target_parsed = std.json.parseFromValue(ZlsOpt, allocator, target, .{}) catch @panic("target parse failed");
+            defer target_parsed.deinit();
+            return try allocator.dupe(u8, target_parsed.value.tarball);
+        },
+        else => {
+            @panic("Invalid response for ZLS");
+        },
+    }
+}
+
 fn getVersionUrl(
     arena: Allocator,
     app_data_path: []const u8,
     semantic_version: SemanticVersion,
 ) !DownloadUrl {
-    if (build_options.exe == .zls) return DownloadUrl.initOfficial(std.fmt.allocPrint(
-        arena,
-        "https://builds.zigtools.org/zls-{s}-{}.{s}",
-        .{ os_arch, semantic_version, archive_ext },
-    ) catch |e| oom(e));
+    if (build_options.exe == .zls) return DownloadUrl.initOfficial(
+        getZlsUrl(arena, semantic_version) catch |e| oom(e),
+    );
 
     if (!isMachVersion(semantic_version)) return makeOfficialUrl(arena, semantic_version);
 
