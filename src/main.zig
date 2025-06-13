@@ -377,13 +377,21 @@ pub fn main() !void {
     defer arena.free(app_data_path);
     log.info("appdata '{s}'", .{app_data_path});
 
+    var client = std.http.Client{ .allocator = arena };
+    defer client.deinit();
+
+    client.initDefaultProxies(arena) catch |err| std.debug.panic(
+        "init proxy failed with {s}",
+        .{@errorName(err)},
+    );
+
     const semantic_version = semantic_version: switch (version_specifier) {
         .semantic => |v| v,
         .master => {
             const download_index_kind: DownloadIndexKind = .official;
             const index_path = try std.fs.path.join(arena, &.{ app_data_path, download_index_kind.basename() });
             defer arena.free(index_path);
-            try fetchFile(arena, download_index_kind.url(), download_index_kind.uri(), index_path);
+            try fetchFile(arena, &client, download_index_kind.url(), download_index_kind.uri(), index_path);
             const index_content = blk: {
                 // since we just downloaded the file, this should always succeed now
                 const file = try std.fs.cwd().openFile(index_path, .{});
@@ -431,11 +439,12 @@ pub fn main() !void {
             }
         }
 
-        const url = try getVersionUrl(arena, app_data_path, semantic_version);
+        const url = try getVersionUrl(arena, &client, app_data_path, semantic_version);
         defer url.deinit(arena);
         const hash = hashAndPath(try cmdFetch(
             gpa,
             arena,
+            &client,
             global_cache_directory,
             url.fetch,
             .{ .debug_hash = false },
@@ -867,12 +876,11 @@ const ZlsOpt = struct {
     size: []const u8,
 };
 
-fn getZlsUrl(allocator: Allocator, semantic_version: SemanticVersion) ![]const u8 {
-    var client = std.http.Client{ .allocator = allocator };
-    defer client.deinit();
-
-    client.initDefaultProxies(allocator) catch @panic("proxy error");
-
+fn getZlsUrl(
+    allocator: Allocator,
+    client: *std.http.Client,
+    semantic_version: SemanticVersion,
+) ![]const u8 {
     const uri = std.mem.replaceOwned(
         u8,
         allocator,
@@ -894,17 +902,13 @@ fn getZlsUrl(allocator: Allocator, semantic_version: SemanticVersion) ![]const u
         .response_storage = .{ .dynamic = &response_body },
     }) catch @panic("zls fetch failed");
 
-    const res_json = std.json.parseFromSlice(std.json.Value, allocator, response_body.items, .{}) catch @panic("target parse failed");
-    defer res_json.deinit();
-    const res_val = res_json.value;
+    const res = std.json.parseFromSliceLeaky(std.json.Value, allocator, response_body.items, .{}) catch @panic("target parse failed");
 
-    switch (res_val) {
+    switch (res) {
         .object => {
-            res_val.dump();
-            const target = res_val.object.get(arch_os) orelse @panic("no ZLS build for current platform");
-            const target_parsed = std.json.parseFromValue(ZlsOpt, allocator, target, .{}) catch @panic("target parse failed");
-            defer target_parsed.deinit();
-            return try allocator.dupe(u8, target_parsed.value.tarball);
+            const target = res.object.get(arch_os) orelse @panic("no ZLS build for current platform");
+            const target_parsed = std.json.parseFromValueLeaky(ZlsOpt, allocator, target, .{}) catch @panic("target parse failed");
+            return try allocator.dupe(u8, target_parsed.tarball);
         },
         else => {
             @panic("Invalid response for ZLS");
@@ -914,11 +918,12 @@ fn getZlsUrl(allocator: Allocator, semantic_version: SemanticVersion) ![]const u
 
 fn getVersionUrl(
     arena: Allocator,
+    client: *std.http.Client,
     app_data_path: []const u8,
     semantic_version: SemanticVersion,
 ) !DownloadUrl {
     if (build_options.exe == .zls) return DownloadUrl.initOfficial(
-        getZlsUrl(arena, semantic_version) catch |e| oom(e),
+        getZlsUrl(arena, client, semantic_version) catch |e| oom(e),
     );
 
     if (!isMachVersion(semantic_version)) return makeOfficialUrl(arena, semantic_version);
@@ -941,7 +946,7 @@ fn getVersionUrl(
             return url;
     }
 
-    try fetchFile(arena, download_index_kind.url(), download_index_kind.uri(), index_path);
+    try fetchFile(arena, client, download_index_kind.url(), download_index_kind.uri(), index_path);
     const index_content = blk: {
         // since we just downloaded the file, this should always succeed now
         const file = try std.fs.cwd().openFile(index_path, .{});
@@ -1038,6 +1043,7 @@ fn hashAndPath(hash: zig.Package.Hash) HashAndPath {
 
 fn fetchFile(
     scratch: Allocator,
+    client: *std.http.Client,
     url_string: []const u8,
     uri: std.Uri,
     out_filepath: []const u8,
@@ -1057,12 +1063,6 @@ fn fetchFile(
     var file_lock = try LockFile.lock(lock_filepath);
     defer file_lock.unlock();
 
-    var client = std.http.Client{ .allocator = scratch };
-    defer client.deinit();
-    client.initDefaultProxies(scratch) catch |err| std.debug.panic(
-        "fetch '{}': init proxy failed with {s}",
-        .{ uri, @errorName(err) },
-    );
     var header_buffer: [4096]u8 = undefined;
     var request = client.open(.GET, uri, .{
         .server_header_buffer = &header_buffer,
@@ -1155,6 +1155,7 @@ fn fetchFile(
 pub fn cmdFetch(
     gpa: Allocator,
     arena: Allocator,
+    http_client: *std.http.Client,
     global_cache_directory: Directory,
     url: []const u8,
     opt: struct {
@@ -1169,13 +1170,10 @@ pub fn cmdFetch(
     try thread_pool.init(.{ .allocator = gpa });
     defer thread_pool.deinit();
 
-    var http_client: std.http.Client = .{ .allocator = gpa };
-    defer http_client.deinit();
-
     try http_client.initDefaultProxies(arena);
 
     var job_queue: Package.Fetch.JobQueue = .{
-        .http_client = &http_client,
+        .http_client = http_client,
         .thread_pool = &thread_pool,
         .global_cache = global_cache_directory,
         .recursive = false,
